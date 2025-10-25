@@ -1,0 +1,177 @@
+name: Build ReDroid (hosted, auto docker image)
+
+# 手动触发或通过 API 触发
+on:
+  workflow_dispatch:
+    inputs:
+      jobs_threads:
+        description: 'make -j (建议小一点，例如 4)'
+        required: false
+        default: '4'
+
+permissions:
+  contents: read
+  packages: write   # 推 ghcr 时需要 write 权限（需要仓库设置允许）
+
+jobs:
+  build:
+    # GitHub-hosted runner（注意 6 小时上限）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        product: [ "redroid_x86_64", "redroid_arm64" ]
+    env:
+      JOBS: ${{ github.event.inputs.jobs_threads }}
+      REPO_BRANCH: android-11.0.0_r48    # 按你示例使用 android-11 分支
+      LOCAL_MANIFESTS_BRANCH: 11.0.0
+      WORKDIR: ${{ runner.workspace }}/redroid-workspace
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || '' }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || '' }}
+
+    steps:
+    - name: Checkout repo (workflow files)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Show runner disk
+      run: df -h && free -m
+
+    - name: Install small host deps (curl, tar)
+      run: sudo apt-get update && sudo apt-get install -y qemu-utils
+
+    - name: Create builder Dockerfile
+      run: |
+        mkdir -p builder
+        cat > builder/Dockerfile <<'EOF'
+        ARG BASE=ubuntu:22.04
+        FROM ${BASE} AS builder
+        ARG userid=1000
+        ARG groupid=1000
+        ARG username=builder
+
+        ENV DEBIAN_FRONTEND=noninteractive
+        ENV HOME=/home/${username}
+        ENV LANG=C.UTF-8
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+          git git-lfs curl ca-certificates gnupg flex bison gperf build-essential \
+          zip unzip python3 python3-pip openjdk-11-jdk-headless \
+          zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev lib32z-dev \
+          ccache rsync libxml2-utils xsltproc bc wget sudo file locales e2fsprogs \
+          && rm -rf /var/lib/apt/lists/*
+
+        RUN mkdir -p /usr/local/bin && \
+          curl -fsSLo /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo && \
+          chmod a+x /usr/local/bin/repo
+
+        RUN groupadd -g ${groupid} ${username} || true && \
+            useradd -m -u ${userid} -g ${groupid} -s /bin/bash ${username} || true && \
+            mkdir -p /home/${username}/bin && chown -R ${userid}:${groupid} /home/${username}
+
+        RUN mkdir -p /ccache && chown ${userid}:${groupid} /ccache
+
+        USER ${userid}:${groupid}
+        WORKDIR /home/${username}
+        ENV PATH=/usr/local/bin:/home/${username}/bin:$PATH
+        ENV CCACHE_DIR=/ccache
+        CMD ["/bin/bash"]
+        EOF
+
+    - name: Build redroid-builder image
+      run: |
+        docker build --build-arg userid=$(id -u) --build-arg groupid=$(id -g) --build-arg username=$(id -un) -t redroid-builder builder/
+
+    - name: Prepare workspace directory
+      run: |
+        rm -rf "${WORKDIR}"
+        mkdir -p "${WORKDIR}"
+        ls -lah "${WORKDIR}"
+
+    - name: Repo init & sync (shallow-ish)
+      run: |
+        set -euo pipefail
+        export PATH=/usr/local/bin:$PATH
+        cd "${WORKDIR}"
+        # 使用 android.googlesource 的 manifest（你原示例所用）
+        repo init -u https://android.googlesource.com/platform/manifest --git-lfs --depth=1 -b $REPO_BRANCH || true
+        # 加 local_manifests（remote-android/local_manifests）
+        mkdir -p .repo/local_manifests
+        git clone --depth=1 https://github.com/remote-android/local_manifests.git .repo/local_manifests -b $LOCAL_MANIFESTS_BRANCH || true
+        # sync（并行数少一点以降低网络压力）
+        repo sync -c -j4 || repo sync -c -j2 || true
+        ls -lah
+
+    - name: Apply redroid patches (best-effort)
+      run: |
+        cd "${WORKDIR}"
+        git clone --depth=1 https://github.com/remote-android/redroid-patches.git /tmp/redroid-patches || true
+        if [ -f /tmp/redroid-patches/apply-patch.sh ]; then
+          /tmp/redroid-patches/apply-patch.sh "${WORKDIR}" || echo "apply-patch returned non-zero (inspect logs)"
+        else
+          echo "no redroid-patches script found; continue"
+        fi
+
+    - name: Run build inside redroid-builder container
+      run: |
+        set -e
+        cd "${WORKDIR}"
+        # 挂载源码到容器并使用 ccache（宿主 runner 的 ~/.ccache 被挂载）
+        docker run --rm -v "${WORKDIR}":/src -v $HOME/.ccache:/ccache -e CCACHE_DIR=/ccache -e JOBS=${{ env.JOBS }} redroid-builder /bin/bash -lc "\
+          cd /src && \
+          source build/envsetup.sh || true && \
+          lunch ${PRODUCT:-${{ matrix.product }}}-userdebug || true && \
+          echo 'Starting build ${PRODUCT:-${{ matrix.product }}}' && \
+          m -j${{ env.JOBS }} systemimage || make -j${{ env.JOBS }} systemimage || true
+        "
+
+    - name: List build output
+      run: |
+        set -e
+        cd "${WORKDIR}/out/target/product/${{ matrix.product }}" || exit 0
+        echo "Files in out/target/product/${{ matrix.product }}:"
+        ls -lah || true
+        du -sh . || true
+
+    - name: Try package root -> docker image (if root exists)
+      continue-on-error: true
+      run: |
+        set -e
+        cd "${WORKDIR}/out/target/product/${{ matrix.product }}" || exit 0
+        if [ -d root ] && [ "$(ls -A root)" ]; then
+          echo "root dir found - creating tar and importing to docker"
+          TARNAME="redroid-rootfs-${{ matrix.product }}.tar"
+          tar --xattrs -C root -c . > "$TARNAME"
+          ls -lh "$TARNAME"
+          # import to docker image
+          cat "$TARNAME" | docker import -c 'ENTRYPOINT ["/init", "androidboot.hardware=redroid"]' - "redroid:${{ matrix.product }}-ci"
+          docker image ls | grep "redroid" || true
+          # optionally push to GHCR if token provided
+          if [ -n "${GHCR_TOKEN}" ]; then
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+            docker tag "redroid:${{ matrix.product }}-ci" "ghcr.io/${{ github.repository_owner }}/redroid:${{ matrix.product }}-ci"
+            docker push "ghcr.io/${{ github.repository_owner }}/redroid:${{ matrix.product }}-ci"
+          else
+            echo "GHCR_TOKEN not set, skipping push"
+          fi
+        else
+          echo "No root dir present; cannot import rootfs automatically. Artifacts will be uploaded for manual image creation."
+        fi
+
+    - name: Upload build artifacts (always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: redroid-artifacts-${{ matrix.product }}-${{ github.run_id }}
+        path: |
+          ${WORKDIR}/out/target/product/${{ matrix.product }}/system.img
+          ${WORKDIR}/out/target/product/${{ matrix.product }}/vendor.img
+          ${WORKDIR}/out/target/product/${{ matrix.product }}/product.img
+          ${WORKDIR}/out/target/product/${{ matrix.product }}/root
+        retention-days: 7
+
+    - name: Print final note
+      if: always()
+      run: |
+        echo "Job finished for product=${{ matrix.product }}. Check uploaded artifact redroid-artifacts-${{ matrix.product }}-${{ github.run_id }} for images/root."
+        echo "If docker image import succeeded, it is tagged redroid:${{ matrix.product }}-ci (and possibly pushed to GHCR)."
