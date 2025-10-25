@@ -1,0 +1,130 @@
+name: Build ReDroid (hosted, parallel x86_64+arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobs_threads:
+        description: 'make -j (建议小一点，例: 4)'
+        required: false
+        default: '4'
+
+concurrency:
+  group: build-redroid-hosted
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360  # GitHub-hosted 单 job 最大 360 分钟
+    strategy:
+      matrix:
+        product: [ "redroid_x86_64", "redroid_arm64" ]
+    env:
+      REPO_BRANCH: lineage-23.0
+      JOBS: ${{ github.event.inputs.jobs_threads }}
+      SOURCE_TAR_URL: ${{ secrets.SOURCE_TAR_URL || '' }}
+
+    steps:
+    - name: Checkout workflow repo (no submodules)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup repo tool
+      run: |
+        mkdir -p ~/bin
+        curl -sS https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod +x ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
+
+    - name: Restore ccache
+      uses: actions/cache@v4
+      with:
+        path: /home/runner/.ccache
+        key: ${{ runner.os }}-ccache-${{ hashFiles('**/build.gradle','**/buildspec','**/Dockerfile') }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    - name: Restore repo mirror cache (optional)
+      uses: actions/cache@v4
+      with:
+        path: .repo
+        key: ${{ runner.os }}-repo-${{ hashFiles('.repo/local_manifests/**') }}
+        restore-keys: |
+          ${{ runner.os }}-repo-
+
+    - name: Pull AOSP builder image
+      run: |
+        docker pull alexanderwolz/aosp-docker:latest || docker pull kylemanna/docker-aosp:latest
+
+    - name: Prepare source (download snapshot if provided)
+      id: prepare_src
+      run: |
+        set -e
+        mkdir -p workspace
+        cd workspace
+        if [ -n "${SOURCE_TAR_URL}" ]; then
+          echo "SOURCE_TAR_URL provided - downloading snapshot..."
+          curl -fsSL "${SOURCE_TAR_URL}" -o source.tar.xz
+          echo "Extracting snapshot..."
+          tar -xJf source.tar.xz
+        else
+          echo "No SOURCE_TAR_URL - will perform repo init & sync (may be slow/timeout)"
+        fi
+        ls -lah
+
+    - name: Repo init & sync (only if snapshot not provided)
+      if: steps.prepare_src.outputs == '' || steps.prepare_src.outcome == 'success' && env.SOURCE_TAR_URL == ''
+      working-directory: workspace
+      run: |
+        set -e
+        export PATH=~/bin:$PATH
+        repo init -u https://github.com/LineageOS/android.git -b $REPO_BRANCH --git-lfs || repo init -u https://github.com/LineageOS/android.git -b $REPO_BRANCH
+        # shallow + fewer threads to reduce bandwidth/time; 可能需要根据情况调整
+        repo sync -j4 --no-clone-bundle --current-branch || repo sync -j2
+
+    - name: Inject Redroid manifests / device/vendor (light)
+      working-directory: workspace
+      run: |
+        set -e
+        # 若你使用 platform_manifests，可在这里 clone
+        mkdir -p .repo/local_manifests
+        git clone https://github.com/remote-android/platform_manifests.git .repo/local_manifests || true
+        # 若需要手动补充 device/vendor:
+        git clone --depth=1 https://github.com/remote-android/device_redroid.git device/generic/redroid || true
+        git clone --depth=1 https://github.com/remote-android/vendor_redroid.git vendor/redroid || true
+        # 可选：redroid-patches（可能需要人工处理冲突）
+        git clone --depth=1 https://github.com/remote-android/redroid-patches.git /tmp/redroid-patches || true
+        if [ -f /tmp/redroid-patches/apply-patch.sh ]; then
+          /tmp/redroid-patches/apply-patch.sh $(pwd) || echo "apply-patch.sh returned non-zero; check logs"
+        fi
+
+    - name: Run build inside Docker
+      working-directory: workspace
+      run: |
+        set -e
+        # 把 workspace 挂到 /workspace，挂载 ccache
+        docker run --rm -v $PWD:/workspace -v /home/runner/.ccache:/ccache \
+          -e CCACHE_DIR=/ccache -e JOBS=${JOBS} \
+          alexanderwolz/aosp-docker:latest /bin/bash -lc "\
+            cd /workspace && \
+            source build/envsetup.sh || true && \
+            lunch ${PRODUCT}-userdebug || lunch redroid_x86_64-userdebug && \
+            echo 'Start build for ${PRODUCT}' && \
+            m -j\$JOBS systemimage || make -j\$JOBS systemimage"
+
+    - name: Upload artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: redroid-artifacts-${{ matrix.product }}-${{ github.run_id }}
+        path: workspace/out/target/product/${{ matrix.product }}/*
+
+    - name: Print build logs path (if present)
+      if: always()
+      run: |
+        echo "Artifacts uploaded. Check the artifact named redroid-artifacts-${{ matrix.product }}-${{ github.run_id }}"
+
